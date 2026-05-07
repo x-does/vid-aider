@@ -4,7 +4,8 @@ export type ModelKind = 'stl' | 'obj' | 'gltf' | 'glb' | 'demo';
 
 export type StudioTransform = {
   position: { x: number; y: number; z: number };
-  rotation: { x: number; y: number; z: number };
+  baseRotation: { x: number; y: number; z: number };
+  spinRotation: { x: number; y: number; z: number };
   scale: number;
 };
 
@@ -37,13 +38,15 @@ export type CreateAssetInput = {
 
 export type TransformPatch = {
   position?: Partial<StudioTransform['position']>;
-  rotation?: Partial<StudioTransform['rotation']>;
+  baseRotation?: Partial<StudioTransform['baseRotation']>;
+  spinRotation?: Partial<StudioTransform['spinRotation']>;
   scale?: number;
 };
 
 const defaultTransform: StudioTransform = {
   position: { x: 0, y: 0, z: 0 },
-  rotation: { x: 0, y: 0, z: 0 },
+  baseRotation: { x: 0, y: 0, z: 0 },
+  spinRotation: { x: 0, y: 0, z: 0 },
   scale: 1,
 };
 
@@ -88,8 +91,27 @@ export function applyTransformToTargets(
       ...asset,
       transform: {
         position: { ...asset.transform.position, ...input.patch.position },
-        rotation: { ...asset.transform.rotation, ...input.patch.rotation },
+        baseRotation: { ...asset.transform.baseRotation, ...input.patch.baseRotation },
+        spinRotation: { ...asset.transform.spinRotation, ...input.patch.spinRotation },
         scale: input.patch.scale ?? asset.transform.scale,
+      },
+    };
+  });
+}
+
+export function advanceSpinForAssets(assets: StudioAsset[], deltaSeconds: number): StudioAsset[] {
+  if (deltaSeconds <= 0) return assets;
+  return assets.map((asset) => {
+    if (!asset.visible || !asset.spin.enabled || asset.spin.rpm <= 0) return asset;
+    const radians = (asset.spin.rpm * Math.PI * 2 * deltaSeconds) / 60;
+    return {
+      ...asset,
+      transform: {
+        ...asset.transform,
+        spinRotation: {
+          ...asset.transform.spinRotation,
+          [asset.spin.axis]: asset.transform.spinRotation[asset.spin.axis] + radians,
+        },
       },
     };
   });

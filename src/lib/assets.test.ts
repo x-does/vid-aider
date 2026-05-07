@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  advanceSpinForAssets,
   applyTransformToTargets,
   createAssetRecord,
   getTargetAssetIds,
@@ -25,6 +26,8 @@ describe('multi-asset studio helpers', () => {
     assert.equal(asset.group, 'stl');
     assert.equal(asset.visible, true);
     assert.deepEqual(asset.transform.position, { x: 0, y: 0, z: 0 });
+    assert.deepEqual(asset.transform.baseRotation, { x: 0, y: 0, z: 0 });
+    assert.deepEqual(asset.transform.spinRotation, { x: 0, y: 0, z: 0 });
     assert.deepEqual(asset.spin, { enabled: true, axis: 'y', rpm: 8 });
   });
 
@@ -52,5 +55,13 @@ describe('multi-asset studio helpers', () => {
 
     assert.equal(updated.find((asset) => asset.id === 'a')?.visible, true);
     assert.equal(updated.find((asset) => asset.id === 'b')?.visible, false);
+  });
+
+  it('advances spin into state so animation is not reset by the renderer loop', () => {
+    const [updated] = advanceSpinForAssets([sampleAssets[0]], 0.5);
+
+    assert.ok(updated.transform.spinRotation.y > 0);
+    assert.equal(updated.transform.baseRotation.y, 0);
+    assert.equal(updated.transform.position.x, 0);
   });
 });

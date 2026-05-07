@@ -7,6 +7,7 @@ import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 
 import {
+  advanceSpinForAssets,
   applySpinToTargets,
   applyTransformToTargets,
   createAssetRecord,
@@ -69,7 +70,11 @@ function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap)
 function applyTransform(object: THREE.Object3D, transform: StudioTransform, visible: boolean) {
   object.visible = visible;
   object.position.set(transform.position.x, transform.position.y, transform.position.z);
-  object.rotation.set(transform.rotation.x, transform.rotation.y, transform.rotation.z);
+  object.rotation.set(
+    transform.baseRotation.x + transform.spinRotation.x,
+    transform.baseRotation.y + transform.spinRotation.y,
+    transform.baseRotation.z + transform.spinRotation.z,
+  );
   object.scale.setScalar(transform.scale);
 }
 
@@ -171,16 +176,16 @@ export function ModelStudio() {
     scene.add(demo);
     objectsRef.current.set('demo', demo);
 
-    const clock = new THREE.Clock();
-    const animate = () => {
-      const dt = clock.getDelta();
-      for (const asset of assetsRef.current) {
+    let previousFrameTime = performance.now();
+    const animate = (frameTime = performance.now()) => {
+      const dt = Math.min((frameTime - previousFrameTime) / 1000, 0.08);
+      previousFrameTime = frameTime;
+      const advancedAssets = advanceSpinForAssets(assetsRef.current, dt);
+      assetsRef.current = advancedAssets;
+      for (const asset of advancedAssets) {
         const object = objectsRef.current.get(asset.id);
         if (!object) continue;
         applyTransform(object, asset.transform, asset.visible);
-        if (asset.visible && asset.spin.enabled) {
-          object.rotation[asset.spin.axis] += (asset.spin.rpm * Math.PI * 2 * dt) / 60;
-        }
       }
       renderer.render(scene, camera);
       animationRef.current = window.requestAnimationFrame(animate);
