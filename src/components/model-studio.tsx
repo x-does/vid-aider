@@ -31,12 +31,12 @@ type ObjectMap = Map<string, THREE.Object3D>;
 function makeDemoObject() {
   const group = new THREE.Group();
   const torus = new THREE.Mesh(
-    new THREE.TorusKnotGeometry(0.9, 0.28, 144, 18),
-    new THREE.MeshStandardMaterial({ color: '#c6a8ff', roughness: 0.32, metalness: 0.42 }),
+    new THREE.TorusKnotGeometry(1.28, 0.38, 144, 18),
+    new THREE.MeshStandardMaterial({ color: '#d8c2ff', emissive: '#3c1d73', emissiveIntensity: 0.3, roughness: 0.28, metalness: 0.5 }),
   );
   const core = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(0.55, 1),
-    new THREE.MeshStandardMaterial({ color: '#7ee5ff', roughness: 0.24, metalness: 0.16, transparent: true, opacity: 0.72 }),
+    new THREE.IcosahedronGeometry(0.78, 1),
+    new THREE.MeshStandardMaterial({ color: '#7ee5ff', emissive: '#115566', emissiveIntensity: 0.36, roughness: 0.2, metalness: 0.18, transparent: true, opacity: 0.88 }),
   );
   group.add(torus, core);
   return group;
@@ -92,7 +92,7 @@ function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap)
   const distance = maxDim * 2.4;
   camera.near = Math.max(0.01, distance / 10000);
   camera.far = getCameraFarPlane(distance);
-  camera.position.set(center.x + distance, center.y + distance * 0.62, center.z + distance);
+  camera.position.set(center.x + distance * 0.78, center.y + distance * 0.48, center.z + distance * 0.78);
   camera.lookAt(center);
   camera.updateProjectionMatrix();
 }
@@ -105,7 +105,6 @@ function applyTransform(object: THREE.Object3D, transform: StudioTransform, visi
     transform.baseRotation.y + transform.spinRotation.y,
     transform.baseRotation.z + transform.spinRotation.z,
   );
-  object.scale.setScalar(transform.scale);
 }
 
 function Help({ text }: { text: string }) {
@@ -277,6 +276,12 @@ export function ModelStudio() {
       const record = createAssetRecord({ id, name: file.name, kind, size: file.size, group: kind });
       record.transform.position.x = index * 2.6;
       record.transform.scale = 1;
+      object.visible = record.visible;
+
+      const demoObject = objectsRef.current.get('demo');
+      if (demoObject) demoObject.visible = true;
+      fitCameraToObjects(cameraRef.current!, objectsRef.current);
+
       if (normalized.largestDimension === 0) setStatus(`${file.name} loaded but has empty bounds`);
       return record;
     } finally {
