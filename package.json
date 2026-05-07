@@ -1,0 +1,46 @@
+{
+  "name": "vid-aider",
+  "version": "0.1.0",
+  "description": "Browser-based video creation helper for importing 3D models, animating loops, and recording showcase clips.",
+  "main": "index.js",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "tsx --test src/**/*.test.ts"
+  },
+  "keywords": [
+    "video",
+    "threejs",
+    "3d",
+    "stl",
+    "obj",
+    "animation",
+    "xdoes"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "next": "^16.2.5",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "tailwind-merge": "^3.5.0",
+    "three": "^0.184.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.4",
+    "@types/node": "^25.6.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@types/three": "^0.184.1",
+    "tailwindcss": "^4.2.4",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  },
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/x-does/vid-aider.git"
+  }
+}
