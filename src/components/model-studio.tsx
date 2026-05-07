@@ -42,6 +42,15 @@ function makeDemoObject() {
   return group;
 }
 
+function normalizeDemoObject(object: THREE.Object3D) {
+  object.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(object);
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  object.position.sub(center);
+  object.updateMatrixWorld(true);
+}
+
 function normalizeImportedObject(object: THREE.Object3D) {
   object.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(object);
@@ -194,8 +203,10 @@ export function ModelStudio() {
 
     const demo = makeDemoObject();
     prepObject(demo);
+    normalizeDemoObject(demo);
     scene.add(demo);
     objectsRef.current.set('demo', demo);
+    fitCameraToObjects(camera, objectsRef.current);
 
     let previousFrameTime = performance.now();
     const animate = (frameTime = performance.now()) => {
