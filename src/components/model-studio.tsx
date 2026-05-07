@@ -21,6 +21,7 @@ import {
   type StudioAsset,
   type StudioTransform,
 } from '@/lib/assets';
+import { getCameraFarPlane, getImportScale, getLargestDimension } from '@/lib/import-normalize';
 import { formatBytes, getModelKind } from '@/lib/model-files';
 import { clampFps, fpsPresets, resolutionPresets } from '@/lib/video-options';
 
@@ -41,11 +42,27 @@ function makeDemoObject() {
   return group;
 }
 
+function normalizeImportedObject(object: THREE.Object3D) {
+  object.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(object);
+  if (box.isEmpty()) return { largestDimension: 0, scale: 1 };
+
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const scale = getImportScale(size, 2.2);
+
+  object.position.sub(center);
+  object.scale.multiplyScalar(scale);
+  object.updateMatrixWorld(true);
+
+  return { largestDimension: getLargestDimension(size), scale };
+}
+
 function prepObject(object: THREE.Object3D) {
   object.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) {
       const mesh = child as THREE.Mesh;
-      if (!mesh.material) {
+      if (!mesh.material || Array.isArray(mesh.material)) {
         mesh.material = new THREE.MeshStandardMaterial({ color: '#c6a8ff', roughness: 0.36, metalness: 0.22 });
       }
       mesh.castShadow = true;
@@ -59,12 +76,16 @@ function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap)
   if (!visible.length) return;
   const box = new THREE.Box3();
   visible.forEach((object) => box.expandByObject(object));
+  if (box.isEmpty()) return;
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
   const maxDim = Math.max(size.x, size.y, size.z, 1);
   const distance = maxDim * 2.4;
+  camera.near = Math.max(0.01, distance / 10000);
+  camera.far = getCameraFarPlane(distance);
   camera.position.set(center.x + distance, center.y + distance * 0.62, center.z + distance);
   camera.lookAt(center);
+  camera.updateProjectionMatrix();
 }
 
 function applyTransform(object: THREE.Object3D, transform: StudioTransform, visible: boolean) {
@@ -238,12 +259,15 @@ export function ModelStudio() {
         object = gltf.scene;
       }
       prepObject(object);
+      const normalized = normalizeImportedObject(object);
       const id = `${Date.now()}-${index}-${file.name.replace(/[^a-z0-9]/gi, '-')}`;
-      const offset = objectsRef.current.size * 0.85;
-      object.position.x = offset;
       sceneRef.current?.add(object);
       objectsRef.current.set(id, object);
-      return createAssetRecord({ id, name: file.name, kind, size: file.size, group: kind });
+      const record = createAssetRecord({ id, name: file.name, kind, size: file.size, group: kind });
+      record.transform.position.x = index * 2.6;
+      record.transform.scale = 1;
+      if (normalized.largestDimension === 0) setStatus(`${file.name} loaded but has empty bounds`);
+      return record;
     } finally {
       URL.revokeObjectURL(url);
     }
@@ -258,10 +282,7 @@ export function ModelStudio() {
       setStatus('No supported files');
       return;
     }
-    setAssets((current) => {
-      const keepDemo = current.length === 1 && current[0]?.id === 'demo' ? [] : current;
-      return selectAsset([...keepDemo, ...loaded], loaded[0].id);
-    });
+    setAssets((current) => selectAsset([...current, ...loaded], loaded[0].id));
     setSelectedId(loaded[0].id);
     setActiveGroup(loaded[0].group);
     setStatus(`${loaded.length} loaded`);
