@@ -2,9 +2,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
+
+import { RecordingControls } from '@/components/recording-controls';
+import { TimelinePanel } from '@/components/timeline-panel';
 
 import {
   advanceSpinForAssets,
@@ -23,6 +27,21 @@ import {
 } from '@/lib/assets';
 import { getCameraFarPlane, getImportScale, getLargestDimension } from '@/lib/import-normalize';
 import { formatBytes, getModelKind } from '@/lib/model-files';
+import { getRecorderTransition, type RecorderState } from '@/lib/recorder';
+import {
+  addKeyframe,
+  createDefaultTimeline,
+  deleteClip,
+  getEnabledClipSegments,
+  interpolateAssetTransform,
+  interpolateCameraTransform,
+  removeKeyframe,
+  splitClipAtTime,
+  trimClipEnd,
+  trimClipStart,
+  type TimelineStage,
+  type TimelineState,
+} from '@/lib/timeline';
 import { clampFps, fpsPresets, resolutionPresets } from '@/lib/video-options';
 
 type Tab = 'studio' | 'assets' | 'export';
@@ -80,12 +99,16 @@ function prepObject(object: THREE.Object3D) {
   });
 }
 
-function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap) {
-  const visible = [...objects.values()].filter((object) => object.visible);
-  if (!visible.length) return;
+function getObjectsBounds(objects: THREE.Object3D[]) {
+  const visible = objects.filter((object) => object.visible);
+  if (!visible.length) return null;
   const box = new THREE.Box3();
   visible.forEach((object) => box.expandByObject(object));
-  if (box.isEmpty()) return;
+  if (box.isEmpty()) return null;
+  return box;
+}
+
+function fitCameraToBox(camera: THREE.PerspectiveCamera, box: THREE.Box3, controls?: OrbitControls | null) {
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
   const maxDim = Math.max(size.x, size.y, size.z, 1);
@@ -95,6 +118,21 @@ function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap)
   camera.position.set(center.x + distance * 0.78, center.y + distance * 0.48, center.z + distance * 0.78);
   camera.lookAt(center);
   camera.updateProjectionMatrix();
+  if (controls) {
+    controls.target.copy(center);
+    controls.update();
+  }
+}
+
+function fitCameraToObjects(camera: THREE.PerspectiveCamera, objects: ObjectMap, controls?: OrbitControls | null) {
+  const box = getObjectsBounds([...objects.values()]);
+  if (box) fitCameraToBox(camera, box, controls);
+}
+
+function fitCameraToObject(camera: THREE.PerspectiveCamera, object: THREE.Object3D | undefined, controls?: OrbitControls | null) {
+  if (!object) return;
+  const box = getObjectsBounds([object]);
+  if (box) fitCameraToBox(camera, box, controls);
 }
 
 function applyTransform(object: THREE.Object3D, transform: StudioTransform, visible: boolean) {
@@ -128,8 +166,15 @@ export function ModelStudio() {
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const controlsRef = useRef<OrbitControls | null>(null);
   const objectsRef = useRef<ObjectMap>(new Map());
   const assetsRef = useRef<StudioAsset[]>([]);
+  const timelineRef = useRef<TimelineState>(createDefaultTimeline());
+  const recordingStateRef = useRef<RecorderState>('idle');
+  const recordingUrlRef = useRef<string | null>(null);
+  const selectedClipIdRef = useRef<string | null>('clip-1');
+  const selectedKeyframeIdRef = useRef<string | null>(null);
+  const playbackRef = useRef<{ lastFrameTime: number | null; segments: { start: number; end: number }[]; segmentIndex: number; recording: boolean }>({ lastFrameTime: null, segments: [], segmentIndex: 0, recording: false });
   const animationRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -143,7 +188,12 @@ export function ModelStudio() {
   const [activeGroup, setActiveGroup] = useState('demo');
   const [resolution, setResolution] = useState<string>(resolutionPresets[0].label);
   const [fps, setFps] = useState<number>(30);
-  const [recording, setRecording] = useState(false);
+  const [timeline, setTimelineState] = useState<TimelineState>(() => createDefaultTimeline());
+  const [recorderState, setRecorderState] = useState<RecorderState>('idle');
+  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+  const [selectedClipId, setSelectedClipIdState] = useState<string | null>('clip-1');
+  const [selectedKeyframeId, setSelectedKeyframeIdState] = useState<string | null>(null);
+  const [lockTargetToSelected, setLockTargetToSelected] = useState(true);
   const [status, setStatus] = useState('Ready');
 
   const currentResolution = useMemo(
@@ -165,9 +215,67 @@ export function ModelStudio() {
     });
   }, []);
 
+  const setTimeline = useCallback((next: TimelineState | ((current: TimelineState) => TimelineState)) => {
+    setTimelineState((current) => {
+      const resolved = typeof next === 'function' ? next(current) : next;
+      timelineRef.current = resolved;
+      return resolved;
+    });
+  }, []);
+
+  const setRecorder = useCallback((next: RecorderState) => {
+    recordingStateRef.current = next;
+    setRecorderState(next);
+  }, []);
+
+  const setSelectedClipId = useCallback((id: string | null) => {
+    selectedClipIdRef.current = id;
+    setSelectedClipIdState(id);
+  }, []);
+
+  const setSelectedKeyframeId = useCallback((id: string | null) => {
+    selectedKeyframeIdRef.current = id;
+    setSelectedKeyframeIdState(id);
+  }, []);
+
   useEffect(() => {
     assetsRef.current = assets;
   }, [assets]);
+
+  const applyTimelineAtTime = useCallback((time: number) => {
+    const activeTimeline = timelineRef.current;
+    const currentAssets = assetsRef.current.map((asset) => {
+      const timelineTransform = interpolateAssetTransform(activeTimeline.keyframes, asset.id, time);
+      if (!timelineTransform) return asset;
+      return {
+        ...asset,
+        spin: timelineTransform.spin,
+        transform: {
+          position: timelineTransform.position,
+          baseRotation: timelineTransform.rotation,
+          spinRotation: { x: 0, y: 0, z: 0 },
+          scale: timelineTransform.scale,
+        },
+      };
+    });
+    assetsRef.current = currentAssets;
+    setAssetsState(currentAssets);
+
+    for (const asset of currentAssets) {
+      const object = objectsRef.current.get(asset.id);
+      if (object) applyTransform(object, asset.transform, asset.visible);
+    }
+
+    const cameraTransform = interpolateCameraTransform(activeTimeline.keyframes, time);
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    if (cameraTransform && camera && controls) {
+      camera.position.set(cameraTransform.cameraPosition.x, cameraTransform.cameraPosition.y, cameraTransform.cameraPosition.z);
+      controls.target.set(cameraTransform.cameraTarget.x, cameraTransform.cameraTarget.y, cameraTransform.cameraTarget.z);
+      camera.lookAt(controls.target);
+      controls.update();
+    }
+  }, []);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -189,6 +297,13 @@ export function ModelStudio() {
     rendererRef.current = renderer;
     mount.appendChild(renderer.domElement);
 
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.enablePan = true;
+    controls.enableZoom = true;
+    controlsRef.current = controls;
+
     const grid = new THREE.GridHelper(7, 20, '#7f6b9d', '#21172f');
     grid.position.y = -1.1;
     scene.add(grid);
@@ -205,19 +320,63 @@ export function ModelStudio() {
     normalizeDemoObject(demo);
     scene.add(demo);
     objectsRef.current.set('demo', demo);
-    fitCameraToObjects(camera, objectsRef.current);
+    fitCameraToObjects(camera, objectsRef.current, controls);
 
     let previousFrameTime = performance.now();
     const animate = (frameTime = performance.now()) => {
       const dt = Math.min((frameTime - previousFrameTime) / 1000, 0.08);
       previousFrameTime = frameTime;
-      const advancedAssets = advanceSpinForAssets(assetsRef.current, dt);
-      assetsRef.current = advancedAssets;
-      for (const asset of advancedAssets) {
-        const object = objectsRef.current.get(asset.id);
-        if (!object) continue;
-        applyTransform(object, asset.transform, asset.visible);
+      const activeTimeline = timelineRef.current;
+      const activePlayback = playbackRef.current;
+
+      if (activeTimeline.playing) {
+        const previousTime = activeTimeline.currentTime;
+        const nextTime = previousTime + dt;
+        const currentSegment = activePlayback.segments[activePlayback.segmentIndex];
+        let resolvedTime = Math.min(nextTime, currentSegment?.end ?? activeTimeline.duration);
+        let done = false;
+
+        if (currentSegment && nextTime >= currentSegment.end) {
+          activePlayback.segmentIndex += 1;
+          const nextSegment = activePlayback.segments[activePlayback.segmentIndex];
+          if (nextSegment) {
+            resolvedTime = nextSegment.start;
+          } else {
+            done = true;
+            resolvedTime = currentSegment.end;
+          }
+        } else if (!currentSegment && nextTime >= activeTimeline.duration) {
+          done = true;
+          resolvedTime = activeTimeline.duration;
+        }
+
+        const nextTimeline = { ...activeTimeline, currentTime: resolvedTime, playing: !done };
+        timelineRef.current = nextTimeline;
+        setTimelineState(nextTimeline);
+        applyTimelineAtTime(resolvedTime);
+
+        if (done) {
+          controls.enabled = true;
+          if (activePlayback.recording && mediaRecorderRef.current?.state !== 'inactive') {
+            mediaRecorderRef.current?.stop();
+          }
+          activePlayback.recording = false;
+        }
+      } else {
+        const hasAssetTimeline = activeTimeline.keyframes.some((keyframe) => keyframe.targetType === 'asset');
+        if (!hasAssetTimeline) {
+          const advancedAssets = advanceSpinForAssets(assetsRef.current, dt);
+          assetsRef.current = advancedAssets;
+          for (const asset of advancedAssets) {
+            const object = objectsRef.current.get(asset.id);
+            if (!object) continue;
+            applyTransform(object, asset.transform, asset.visible);
+          }
+        }
+        controls.enabled = recordingStateRef.current !== 'recording';
+        controls.update();
       }
+
       renderer.render(scene, camera);
       animationRef.current = window.requestAnimationFrame(animate);
     };
@@ -236,10 +395,12 @@ export function ModelStudio() {
     return () => {
       window.removeEventListener('resize', onResize);
       if (animationRef.current) window.cancelAnimationFrame(animationRef.current);
+      controls.dispose();
+      controlsRef.current = null;
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };
-  }, []);
+  }, [applyTimelineAtTime]);
 
   useEffect(() => {
     for (const asset of assets) {
@@ -280,7 +441,7 @@ export function ModelStudio() {
 
       const demoObject = objectsRef.current.get('demo');
       if (demoObject) demoObject.visible = true;
-      fitCameraToObjects(cameraRef.current!, objectsRef.current);
+      fitCameraToObjects(cameraRef.current!, objectsRef.current, controlsRef.current);
 
       if (normalized.largestDimension === 0) setStatus(`${file.name} loaded but has empty bounds`);
       return record;
@@ -302,7 +463,7 @@ export function ModelStudio() {
     setSelectedId(loaded[0].id);
     setActiveGroup(loaded[0].group);
     setStatus(`${loaded.length} loaded`);
-    setTimeout(() => fitCameraToObjects(cameraRef.current!, objectsRef.current), 80);
+    setTimeout(() => fitCameraToObjects(cameraRef.current!, objectsRef.current, controlsRef.current), 80);
   }, [loadOneFile, setAssets]);
 
   const updateTransform = (patch: Parameters<typeof applyTransformToTargets>[1]['patch']) => {
@@ -318,12 +479,20 @@ export function ModelStudio() {
     setSelectedId(id);
     if (asset) setActiveGroup(asset.group);
     setAssets((current) => selectAsset(current, id));
+    if (lockTargetToSelected) fitCameraToObject(cameraRef.current!, objectsRef.current.get(id), controlsRef.current);
   };
 
-  const resetView = () => {
+  const fitAll = () => {
     const camera = cameraRef.current;
-    if (camera) fitCameraToObjects(camera, objectsRef.current);
+    if (camera) fitCameraToObjects(camera, objectsRef.current, controlsRef.current);
   };
+
+  const fitSelected = () => {
+    const camera = cameraRef.current;
+    if (camera) fitCameraToObject(camera, objectsRef.current.get(selectedId), controlsRef.current);
+  };
+
+  const resetView = () => fitAll();
 
   const exportPng = () => {
     const canvas = rendererRef.current?.domElement;
@@ -335,6 +504,87 @@ export function ModelStudio() {
     setStatus('PNG saved');
   };
 
+  const scrubTo = useCallback((time: number) => {
+    const clamped = Math.max(0, Math.min(timelineRef.current.duration, time));
+    setTimeline((current) => ({ ...current, currentTime: clamped, playing: false }));
+    playbackRef.current.recording = false;
+    if (controlsRef.current) controlsRef.current.enabled = true;
+    applyTimelineAtTime(clamped);
+  }, [applyTimelineAtTime, setTimeline]);
+
+  const playTimeline = useCallback((recordingPlayback = false) => {
+    const activeTimeline = timelineRef.current;
+    const clips = recordingPlayback ? getEnabledClipSegments(activeTimeline.clips) : [];
+    const start = clips[0]?.start ?? activeTimeline.currentTime;
+    playbackRef.current = { lastFrameTime: null, segments: clips.map((clip) => ({ start: clip.start, end: clip.end })), segmentIndex: 0, recording: recordingPlayback };
+    if (controlsRef.current) controlsRef.current.enabled = false;
+    setTimeline({ ...activeTimeline, currentTime: start, playing: true });
+    applyTimelineAtTime(start);
+  }, [applyTimelineAtTime, setTimeline]);
+
+  const pauseTimeline = useCallback(() => {
+    setTimeline((current) => ({ ...current, playing: false }));
+    if (controlsRef.current && recordingStateRef.current !== 'recording') controlsRef.current.enabled = true;
+  }, [setTimeline]);
+
+  const stopTimeline = useCallback(() => {
+    playbackRef.current.recording = false;
+    setTimeline((current) => ({ ...current, currentTime: 0, playing: false }));
+    if (controlsRef.current) controlsRef.current.enabled = true;
+    applyTimelineAtTime(0);
+  }, [applyTimelineAtTime, setTimeline]);
+
+  const addTimelineKeyframe = () => {
+    const now = timelineRef.current.currentTime;
+    const stage = timelineRef.current.stage;
+    const id = `${stage}-${Date.now()}`;
+    if (stage === 'camera-motion') {
+      const camera = cameraRef.current;
+      const controls = controlsRef.current;
+      if (!camera || !controls) return;
+      const keyframe = {
+        id,
+        time: now,
+        targetType: 'camera' as const,
+        targetId: 'camera',
+        transform: {
+          cameraPosition: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+          cameraTarget: { x: controls.target.x, y: controls.target.y, z: controls.target.z },
+        },
+      };
+      setTimeline((current) => ({ ...current, keyframes: addKeyframe(current.keyframes, keyframe) }));
+      setSelectedKeyframeId(id);
+      setStatus('Camera keyframe added');
+      return;
+    }
+
+    const targets = targetIds.length ? targetIds : [selectedId];
+    let keyframeId = id;
+    setTimeline((current) => {
+      let keyframes = current.keyframes;
+      for (const targetId of targets) {
+        const asset = assetsRef.current.find((item) => item.id === targetId);
+        if (!asset) continue;
+        keyframeId = `${id}-${targetId}`;
+        keyframes = addKeyframe(keyframes, {
+          id: keyframeId,
+          time: now,
+          targetType: 'asset',
+          targetId,
+          transform: {
+            position: { ...asset.transform.position },
+            rotation: { ...asset.transform.baseRotation },
+            scale: asset.transform.scale,
+            spin: { ...asset.spin },
+          },
+        });
+      }
+      return { ...current, keyframes };
+    });
+    setSelectedKeyframeId(keyframeId);
+    setStatus('Object keyframe added');
+  };
+
   const startRecording = () => {
     const canvas = rendererRef.current?.domElement;
     if (!canvas || !('MediaRecorder' in window)) {
@@ -342,6 +592,9 @@ export function ModelStudio() {
       return;
     }
     chunksRef.current = [];
+    if (recordingUrlRef.current) URL.revokeObjectURL(recordingUrlRef.current);
+    recordingUrlRef.current = null;
+    setRecordingUrl(null);
     const stream = canvas.captureStream(clampFps(fps));
     const recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
     recorder.ondataavailable = (event) => {
@@ -350,22 +603,89 @@ export function ModelStudio() {
     recorder.onstop = () => {
       const blob = new Blob(chunksRef.current, { type: 'video/webm' });
       const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'vid-aider-loop.webm';
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      setStatus(`${currentResolution.label} WebM`);
+      recordingUrlRef.current = url;
+      setRecordingUrl(url);
+      setRecorder(getRecorderTransition(recordingStateRef.current, 'stop'));
+      setTimeline((current) => ({ ...current, playing: false }));
+      if (controlsRef.current) controlsRef.current.enabled = true;
+      setStatus(`${currentResolution.label} WebM ready`);
     };
     mediaRecorderRef.current = recorder;
     recorder.start();
-    setRecording(true);
-    setStatus('Recording');
+    setRecorder(getRecorderTransition(recordingStateRef.current, 'start'));
+    setStatus('Recording enabled clips');
+    playTimeline(true);
+  };
+
+  const pauseRecording = () => {
+    mediaRecorderRef.current?.pause();
+    pauseTimeline();
+    setRecorder(getRecorderTransition(recordingStateRef.current, 'pause'));
+    setStatus('Recording paused');
+  };
+
+  const resumeRecording = () => {
+    mediaRecorderRef.current?.resume();
+    setRecorder(getRecorderTransition(recordingStateRef.current, 'resume'));
+    playTimeline(true);
+    setStatus('Recording resumed');
   };
 
   const stopRecording = () => {
-    mediaRecorderRef.current?.stop();
-    setRecording(false);
+    playbackRef.current.recording = false;
+    if (mediaRecorderRef.current?.state !== 'inactive') mediaRecorderRef.current?.stop();
+    setTimeline((current) => ({ ...current, playing: false }));
+  };
+
+  const downloadRecording = () => {
+    const url = recordingUrlRef.current;
+    if (!url) return;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'vid-aider-timeline.webm';
+    a.click();
+  };
+
+  const updateTimelineDuration = (duration: number) => {
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    setTimeline((current) => ({
+      ...current,
+      duration,
+      currentTime: Math.min(current.currentTime, duration),
+      clips: current.clips.length ? current.clips.map((clip) => (clip.id === 'clip-1' ? { ...clip, end: duration } : clip)) : [{ id: 'clip-1', name: 'Full timeline', start: 0, end: duration, enabled: true }],
+    }));
+  };
+
+  const setTimelineStage = (stage: TimelineStage) => setTimeline((current) => ({ ...current, stage }));
+
+  const cutAtPlayhead = () => {
+    setTimeline((current) => ({ ...current, clips: splitClipAtTime(current.clips, current.currentTime) }));
+    setStatus('Clip cut at playhead');
+  };
+
+  const deleteSelectedTimelineItem = () => {
+    if (selectedKeyframeIdRef.current) {
+      setTimeline((current) => ({ ...current, keyframes: removeKeyframe(current.keyframes, selectedKeyframeIdRef.current!) }));
+      setSelectedKeyframeId(null);
+      setStatus('Keyframe deleted');
+      return;
+    }
+    if (selectedClipIdRef.current) {
+      setTimeline((current) => ({ ...current, clips: deleteClip(current.clips, selectedClipIdRef.current!) }));
+      setStatus('Clip disabled');
+    }
+  };
+
+  const trimSelectedClipStart = () => {
+    const id = selectedClipIdRef.current;
+    if (!id) return;
+    setTimeline((current) => ({ ...current, clips: trimClipStart(current.clips, id, current.currentTime) }));
+  };
+
+  const trimSelectedClipEnd = () => {
+    const id = selectedClipIdRef.current;
+    if (!id) return;
+    setTimeline((current) => ({ ...current, clips: trimClipEnd(current.clips, id, current.currentTime) }));
   };
 
   return (
@@ -381,11 +701,13 @@ export function ModelStudio() {
         <div className="flex flex-wrap items-center gap-2 text-xs text-[#9f91ba]">
           <span title="Current status">{status}</span>
           <Help text="Drop multiple STL, OBJ, GLTF, or GLB files. Use Apply to target selected, all, or a group." />
-          <button type="button" onClick={resetView} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Frame all visible assets">Frame</button>
-          <button type="button" onClick={exportPng} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Save PNG snapshot">PNG</button>
-          <button type="button" onClick={recording ? stopRecording : startRecording} className="rounded-full border border-[#c6a8ff]/30 bg-[#c6a8ff]/10 px-3 py-1.5 text-[#f3edff]" title="Record WebM loop">
-            {recording ? 'Stop' : 'REC'}
+          <button type="button" onClick={resetView} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Reset view to all visible assets">Reset view</button>
+          <button type="button" onClick={fitSelected} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Fit selected asset">Fit selected</button>
+          <button type="button" onClick={fitAll} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Fit all visible assets">Fit all</button>
+          <button type="button" onClick={() => setLockTargetToSelected((value) => !value)} aria-pressed={lockTargetToSelected} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Lock OrbitControls target to selected asset">
+            {lockTargetToSelected ? 'Target locked' : 'Target free'}
           </button>
+          <button type="button" onClick={exportPng} className="rounded-full border border-[#7f6b9d]/18 px-3 py-1.5 hover:text-white" title="Save PNG snapshot">PNG</button>
         </div>
       </div>
 
@@ -495,6 +817,32 @@ export function ModelStudio() {
 
           {tab === 'export' && (
             <div className="space-y-4" id="export">
+              <TimelinePanel
+                timeline={timeline}
+                selectedClipId={selectedClipId}
+                selectedKeyframeId={selectedKeyframeId}
+                onStageChange={setTimelineStage}
+                onPlayPause={() => (timeline.playing ? pauseTimeline() : playTimeline(false))}
+                onStop={stopTimeline}
+                onScrub={scrubTo}
+                onDurationChange={updateTimelineDuration}
+                onAddKeyframe={addTimelineKeyframe}
+                onCut={cutAtPlayhead}
+                onDeleteSelected={deleteSelectedTimelineItem}
+                onTrimStart={trimSelectedClipStart}
+                onTrimEnd={trimSelectedClipEnd}
+                onSelectClip={(id) => { setSelectedClipId(id); setSelectedKeyframeId(null); }}
+                onSelectKeyframe={(id) => { setSelectedKeyframeId(id); setSelectedClipId(null); }}
+              />
+              <RecordingControls
+                state={recorderState}
+                canDownload={Boolean(recordingUrl)}
+                onStart={startRecording}
+                onPause={pauseRecording}
+                onResume={resumeRecording}
+                onStop={stopRecording}
+                onDownload={downloadRecording}
+              />
               <label className="block text-xs text-[#9f91ba]">Size
                 <select value={resolution} onChange={(event) => setResolution(event.target.value)} className="mt-1 w-full rounded-xl border border-[#7f6b9d]/20 bg-[#0b0811]/80 px-3 py-2 text-sm text-[#f3edff]" title="Export target size">
                   {resolutionPresets.map((item) => <option key={item.label}>{item.label}</option>)}
@@ -506,8 +854,8 @@ export function ModelStudio() {
                 </select>
               </label>
               <details className="rounded-2xl border border-[#7f6b9d]/16 bg-[#0b0811]/40 p-3 text-sm text-[#b9accf]">
-                <summary className="cursor-pointer text-[#f3edff]">GIF?</summary>
-                <p className="mt-2 leading-6">Next step: worker GIF export so long loops do not freeze the app. WebM + PNG work now.</p>
+                <summary className="cursor-pointer text-[#f3edff]">Editing note</summary>
+                <p className="mt-2 leading-6">Cuts and trims edit the animation timeline before recording. No ffmpeg.wasm swamp today.</p>
               </details>
             </div>
           )}
